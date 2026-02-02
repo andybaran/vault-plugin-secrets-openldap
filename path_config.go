@@ -113,6 +113,21 @@ func (b *backend) configFields() map[string]*framework.FieldSchema {
 			"'password', 'phrase'. Defaults to 'password'.",
 		Default: defaultCredentialType,
 	}
+	fields["root_rotation_max_retries"] = &framework.FieldSchema{
+		Type:        framework.TypeInt,
+		Default:     5,
+		Description: "Maximum number of retry attempts for root credential rotation when LDAP rejects the password.",
+	}
+	fields["root_rotation_min_retry_delay"] = &framework.FieldSchema{
+		Type:        framework.TypeDurationSecond,
+		Default:     int(5 * time.Second / time.Second),
+		Description: "Minimum delay between root rotation retry attempts (exponential backoff).",
+	}
+	fields["root_rotation_max_retry_delay"] = &framework.FieldSchema{
+		Type:        framework.TypeDurationSecond,
+		Default:     int(60 * time.Second / time.Second),
+		Description: "Maximum delay between root rotation retry attempts (exponential backoff).",
+	}
 
 	automatedrotationutil.AddAutomatedRotationFields(fields)
 
@@ -209,6 +224,37 @@ func (b *backend) configCreateUpdateOperation(ctx context.Context, req *logical.
 		return nil, err
 	}
 
+	// Handle root rotation retry configuration with defaults
+	maxRetries := 5 // default
+	if maxRetriesRaw, ok := fieldData.GetOk("root_rotation_max_retries"); ok {
+		maxRetries = maxRetriesRaw.(int)
+	} else if existing != nil {
+		maxRetries = conf.RootRotationMaxRetries
+	}
+	if maxRetries < 0 {
+		return nil, fmt.Errorf("root_rotation_max_retries must be non-negative")
+	}
+
+	minRetryDelay := 5 * time.Second // default
+	if minRetryDelayRaw, ok := fieldData.GetOk("root_rotation_min_retry_delay"); ok {
+		minRetryDelay = time.Duration(minRetryDelayRaw.(int)) * time.Second
+	} else if existing != nil {
+		minRetryDelay = conf.RootRotationMinRetryDelay
+	}
+	if minRetryDelay < 0 {
+		return nil, fmt.Errorf("root_rotation_min_retry_delay must be non-negative")
+	}
+
+	maxRetryDelay := 60 * time.Second // default
+	if maxRetryDelayRaw, ok := fieldData.GetOk("root_rotation_max_retry_delay"); ok {
+		maxRetryDelay = time.Duration(maxRetryDelayRaw.(int)) * time.Second
+	} else if existing != nil {
+		maxRetryDelay = conf.RootRotationMaxRetryDelay
+	}
+	if maxRetryDelay < minRetryDelay {
+		return nil, fmt.Errorf("root_rotation_max_retry_delay must be >= root_rotation_min_retry_delay")
+	}
+
 	err = conf.ParseAutomatedRotationFields(fieldData)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
@@ -218,6 +264,9 @@ func (b *backend) configCreateUpdateOperation(ctx context.Context, req *logical.
 	conf.PasswordPolicy = passPolicy
 	conf.PasswordLength = passLength
 	conf.SkipStaticRoleImportRotation = staticSkip
+	conf.RootRotationMaxRetries = maxRetries
+	conf.RootRotationMinRetryDelay = minRetryDelay
+	conf.RootRotationMaxRetryDelay = maxRetryDelay
 	conf.LDAP.ConfigEntry = ldapConf
 	conf.LDAP.Schema = schema
 
@@ -365,6 +414,10 @@ type config struct {
 	LDAP                         *client.Config
 	PasswordPolicy               string `json:"password_policy,omitempty"`
 	SkipStaticRoleImportRotation bool   `json:"skip_static_role_import_rotation"`
+
+	RootRotationMaxRetries   int           `json:"root_rotation_max_retries,omitempty"`
+	RootRotationMinRetryDelay time.Duration `json:"root_rotation_min_retry_delay,omitempty"`
+	RootRotationMaxRetryDelay time.Duration `json:"root_rotation_max_retry_delay,omitempty"`
 
 	automatedrotationutil.AutomatedRotationParams
 

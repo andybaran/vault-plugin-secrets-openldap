@@ -97,38 +97,90 @@ func (b *backend) rotateRootCredential(ctx context.Context, req *logical.Request
 		return errors.New("the config is currently unset")
 	}
 
-	newPassword, err := b.GeneratePassword(ctx, config)
-	if err != nil {
-		return err
+	// Determine retry configuration, with defaults if not set
+	maxRetries := config.RootRotationMaxRetries
+	if maxRetries == 0 {
+		maxRetries = 5 // default
 	}
+	minRetryDelay := config.RootRotationMinRetryDelay
+	if minRetryDelay == 0 {
+		minRetryDelay = 5 * time.Second // default
+	}
+	maxRetryDelay := config.RootRotationMaxRetryDelay
+	if maxRetryDelay == 0 {
+		maxRetryDelay = 60 * time.Second // default
+	}
+
 	oldPassword := config.LDAP.BindPassword
 
 	// Take out the backend lock since we are swapping out the connection
 	b.Lock()
 	defer b.Unlock()
 
-	// Update the password remotely.
-	if err := b.client.UpdateDNPassword(config.LDAP, config.LDAP.BindDN, newPassword); err != nil {
-		return err
-	}
-	config.LDAP.BindPassword = newPassword
-	config.LDAP.LastBindPassword = oldPassword
-	config.LDAP.LastBindPasswordRotation = time.Now()
-
-	// Update the password locally.
-	if pwdStoringErr := storePassword(ctx, req.Storage, config); pwdStoringErr != nil {
-		// We were unable to store the new password locally. We can't continue in this state because we won't be able
-		// to roll any passwords, including our own to get back into a state of working. So, we need to roll back to
-		// the last password we successfully got into storage.
-		if rollbackErr := b.rollbackPassword(ctx, config, oldPassword); rollbackErr != nil {
-			return fmt.Errorf(`unable to store new password due to %s and unable to return to previous password
-due to %s, configure a new binddn and bindpass to restore ldap function`, pwdStoringErr, rollbackErr)
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Generate a new password for each attempt
+		newPassword, err := b.GeneratePassword(ctx, config)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to generate password on attempt %d: %w", attempt, err)
+			b.Logger().Error("password generation failed during root rotation", "attempt", attempt, "error", err)
+			continue
 		}
-		return fmt.Errorf("unable to update password due to storage err: %s", pwdStoringErr)
+
+		// Update the password remotely
+		if err := b.client.UpdateDNPassword(config.LDAP, config.LDAP.BindDN, newPassword); err != nil {
+			lastErr = err
+			b.Logger().Warn("root credential rotation failed", "attempt", attempt, "max_retries", maxRetries, "error", err)
+			b.ldapEvent(ctx, "root-rotate-retry", req.Path, "", false)
+
+			// If we haven't exhausted retries, wait before trying again
+			if attempt < maxRetries {
+				retryDelay := calculateExponentialBackoff(attempt, minRetryDelay, maxRetryDelay)
+				b.Logger().Debug("retrying root rotation after delay", "attempt", attempt, "delay", retryDelay)
+
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-timer.C:
+					// Continue to next attempt
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return fmt.Errorf("root rotation cancelled after %d attempts: %w", attempt, ctx.Err())
+				}
+			}
+			continue
+		}
+
+		// Success! Update local configuration
+		config.LDAP.BindPassword = newPassword
+		config.LDAP.LastBindPassword = oldPassword
+		config.LDAP.LastBindPasswordRotation = time.Now()
+
+		// Update the password locally
+		if pwdStoringErr := storePassword(ctx, req.Storage, config); pwdStoringErr != nil {
+			// We were unable to store the new password locally. We can't continue in this state because we won't be able
+			// to roll any passwords, including our own to get back into a state of working. So, we need to roll back to
+			// the last password we successfully got into storage.
+			if rollbackErr := b.rollbackPassword(ctx, config, oldPassword); rollbackErr != nil {
+				return fmt.Errorf(`unable to store new password due to %s and unable to return to previous password
+due to %s, configure a new binddn and bindpass to restore ldap function`, pwdStoringErr, rollbackErr)
+			}
+			return fmt.Errorf("unable to update password due to storage err: %s", pwdStoringErr)
+		}
+
+		// Log success after retries
+		if attempt > 1 {
+			b.Logger().Info("root credential rotation succeeded after retries", "attempt", attempt)
+		}
+
+		// Respond with a 204
+		return nil
 	}
 
-	// Respond with a 204.
-	return nil
+	// All retries exhausted
+	b.ldapEvent(ctx, "root-rotate-retry-exhausted", req.Path, "", false)
+	return fmt.Errorf("root rotation failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 func (b *backend) pathRotateRoleCredentialsUpdate(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
@@ -226,6 +278,17 @@ func (b *backend) rollbackPassword(ctx context.Context, config *config, oldPassw
 			return nil
 		}
 	}
+}
+
+// calculateExponentialBackoff computes the delay for the given attempt number
+// using exponential backoff capped between min and max delays.
+func calculateExponentialBackoff(attempt int, minDelay, maxDelay time.Duration) time.Duration {
+	// Use exponential backoff: minDelay * 2^(attempt-1)
+	delay := minDelay * time.Duration(1<<uint(attempt-1))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
 }
 
 func storePassword(ctx context.Context, s logical.Storage, config *config) error {

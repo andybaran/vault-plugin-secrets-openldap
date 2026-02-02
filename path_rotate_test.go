@@ -223,6 +223,209 @@ func (f *failingRollbackClient) Execute(conf *client.Config, entries []*ldif.Ent
 
 var _ ldapClient = (*failingRollbackClient)(nil)
 
+type retryableClient struct {
+	attempts      int
+	succeedAfter  int
+	lastPassword  string
+	passwords     []string
+}
+
+func (r *retryableClient) UpdateDNPassword(conf *client.Config, dn string, newPassword string) error {
+	r.attempts++
+	r.passwords = append(r.passwords, newPassword)
+	r.lastPassword = newPassword
+	
+	if r.attempts <= r.succeedAfter {
+		return fmt.Errorf("password complexity requirements not met")
+	}
+	return nil
+}
+
+func (r *retryableClient) UpdateUserPassword(conf *client.Config, user, newPassword string) error {
+	panic("not implemented")
+}
+
+func (r *retryableClient) Execute(conf *client.Config, entries []*ldif.Entry, continueOnError bool) error {
+	panic("not implemented")
+}
+
+var _ ldapClient = (*retryableClient)(nil)
+
+func TestRootRotationRetry(t *testing.T) {
+	t.Run("succeeds on first attempt without retry", func(t *testing.T) {
+		b, storage := getBackend(false)
+		defer b.Cleanup(context.Background())
+
+		rclient := &retryableClient{succeedAfter: 0}
+		b.client = rclient
+
+		configureOpenLDAPMountWithRetry(t, b, storage, 5, 1, 10)
+
+		req := &logical.Request{
+			Operation: logical.UpdateOperation,
+			Path:      rotateRootPath,
+			Storage:   storage,
+		}
+
+		resp, err := b.HandleRequest(context.Background(), req)
+		if err != nil || (resp != nil && resp.IsError()) {
+			t.Fatalf("err:%s resp:%#v\n", err, resp)
+		}
+
+		assert.Equal(t, 1, rclient.attempts, "expected 1 attempt when rotation succeeds immediately")
+		assert.Equal(t, 1, len(rclient.passwords), "expected 1 password generated")
+	})
+
+	t.Run("succeeds after retries with new passwords", func(t *testing.T) {
+		b, storage := getBackend(false)
+		defer b.Cleanup(context.Background())
+
+		rclient := &retryableClient{succeedAfter: 2}
+		b.client = rclient
+
+		configureOpenLDAPMountWithRetry(t, b, storage, 5, 1, 10)
+
+		req := &logical.Request{
+			Operation: logical.UpdateOperation,
+			Path:      rotateRootPath,
+			Storage:   storage,
+		}
+
+		resp, err := b.HandleRequest(context.Background(), req)
+		if err != nil || (resp != nil && resp.IsError()) {
+			t.Fatalf("err:%s resp:%#v\n", err, resp)
+		}
+
+		assert.Equal(t, 3, rclient.attempts, "expected 3 attempts (2 failures + 1 success)")
+		assert.Equal(t, 3, len(rclient.passwords), "expected 3 unique passwords generated")
+
+		// Verify each password is unique (new password generated on each retry)
+		uniquePasswords := make(map[string]bool)
+		for _, pwd := range rclient.passwords {
+			uniquePasswords[pwd] = true
+		}
+		assert.Equal(t, 3, len(uniquePasswords), "expected each retry to generate a new password")
+
+		// Verify the config was updated with the successful password
+		config, err := readConfig(context.Background(), storage)
+		assert.Nil(t, err)
+		assert.Equal(t, rclient.lastPassword, config.LDAP.BindPassword, "expected config to have the successful password")
+	})
+
+	t.Run("fails after exhausting max retries", func(t *testing.T) {
+		b, storage := getBackend(false)
+		defer b.Cleanup(context.Background())
+
+		rclient := &retryableClient{succeedAfter: 10}
+		b.client = rclient
+
+		configureOpenLDAPMountWithRetry(t, b, storage, 3, 1, 10)
+
+		req := &logical.Request{
+			Operation: logical.UpdateOperation,
+			Path:      rotateRootPath,
+			Storage:   storage,
+		}
+
+		resp, err := b.HandleRequest(context.Background(), req)
+		if err == nil {
+			t.Fatal("expected error after exhausting retries")
+		}
+		_ = resp // resp might be nil, not checking it
+
+		assert.Equal(t, 3, rclient.attempts, "expected exactly max_retries attempts")
+		assert.Contains(t, err.Error(), "failed after 3 attempts", "error should indicate retry exhaustion")
+	})
+
+	t.Run("uses default retry config when not specified", func(t *testing.T) {
+		b, storage := getBackend(false)
+		defer b.Cleanup(context.Background())
+
+		rclient := &retryableClient{succeedAfter: 3}
+		b.client = rclient
+
+		// Configure without retry settings (should use defaults)
+		data := map[string]interface{}{
+			"binddn":   "tester",
+			"bindpass": "pa$$w0rd",
+			"url":      "ldap://138.91.247.105",
+		}
+
+		req := &logical.Request{
+			Operation: logical.CreateOperation,
+			Path:      configPath,
+			Storage:   storage,
+			Data:      data,
+		}
+
+		resp, err := b.HandleRequest(context.Background(), req)
+		if err != nil || (resp != nil && resp.IsError()) {
+			t.Fatalf("err:%s resp:%#v\n", err, resp)
+		}
+
+		req = &logical.Request{
+			Operation: logical.UpdateOperation,
+			Path:      rotateRootPath,
+			Storage:   storage,
+		}
+
+		resp, err = b.HandleRequest(context.Background(), req)
+		if err != nil || (resp != nil && resp.IsError()) {
+			t.Fatalf("err:%s resp:%#v\n", err, resp)
+		}
+
+		// Default max_retries is 5, so 4 attempts should succeed
+		assert.Equal(t, 4, rclient.attempts, "expected to use default max_retries of 5")
+	})
+}
+
+func TestCalculateExponentialBackoff(t *testing.T) {
+	testCases := []struct {
+		name      string
+		attempt   int
+		minDelay  time.Duration
+		maxDelay  time.Duration
+		expected  time.Duration
+	}{
+		{"first attempt", 1, 5 * time.Second, 60 * time.Second, 5 * time.Second},
+		{"second attempt", 2, 5 * time.Second, 60 * time.Second, 10 * time.Second},
+		{"third attempt", 3, 5 * time.Second, 60 * time.Second, 20 * time.Second},
+		{"fourth attempt", 4, 5 * time.Second, 60 * time.Second, 40 * time.Second},
+		{"capped at max", 5, 5 * time.Second, 60 * time.Second, 60 * time.Second},
+		{"exceeds max", 10, 5 * time.Second, 60 * time.Second, 60 * time.Second},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := calculateExponentialBackoff(tc.attempt, tc.minDelay, tc.maxDelay)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func configureOpenLDAPMountWithRetry(t *testing.T, b *backend, storage logical.Storage, maxRetries, minRetryDelay, maxRetryDelay int) {
+	data := map[string]interface{}{
+		"binddn":                         "tester",
+		"bindpass":                       "pa$$w0rd",
+		"url":                            "ldap://138.91.247.105",
+		"root_rotation_max_retries":      maxRetries,
+		"root_rotation_min_retry_delay":  minRetryDelay,
+		"root_rotation_max_retry_delay":  maxRetryDelay,
+	}
+
+	req := &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      configPath,
+		Storage:   storage,
+		Data:      data,
+	}
+
+	resp, err := b.HandleRequest(context.Background(), req)
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	}
+}
+
 func TestRollbackPassword(t *testing.T) {
 	oldRollbackAttempts, oldMinRollbackDuration, oldMaxRollbackDuration := rollbackAttempts, minRollbackDuration, maxRollbackDuration
 	t.Cleanup(func() {
