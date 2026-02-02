@@ -393,6 +393,11 @@ func (b *backend) configReadOperation(ctx context.Context, req *logical.Request,
 
 	config.PopulateAutomatedRotationData(configMap)
 
+	// Add root rotation retry configuration
+	configMap["root_rotation_max_retries"] = config.RootRotationMaxRetries
+	configMap["root_rotation_min_retry_delay"] = int(config.RootRotationMinRetryDelay / time.Second)
+	configMap["root_rotation_max_retry_delay"] = int(config.RootRotationMaxRetryDelay / time.Second)
+
 	resp := &logical.Response{
 		Data: configMap,
 	}
