@@ -766,6 +766,9 @@ func ldapResponseData(vals ...interface{}) map[string]interface{} {
 		"disable_automated_rotation":       false,
 		"enable_samaccountname_login":      false,
 		"credential_type":                  "password",
+		"root_rotation_max_retries":        5,
+		"root_rotation_min_retry_delay":    5,
+		"root_rotation_max_retry_delay":    60,
 	}
 
 	for i := 0; i < len(vals); i += 2 {
