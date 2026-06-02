@@ -71,20 +71,23 @@ func (b *backend) pathStaticCredsRead(ctx context.Context, req *logical.Request,
 			respData["dn"] = role.StaticAccount.DNB
 			respData["password"] = role.StaticAccount.PasswordB
 			respData["last_password"] = role.StaticAccount.LastPasswordB
-			// Always return the standby (A) account credentials
-			respData["standby_username"] = role.StaticAccount.Username
-			respData["standby_dn"] = role.StaticAccount.DN
-			respData["standby_password"] = role.StaticAccount.Password
-			respData["standby_last_password"] = role.StaticAccount.LastPassword
-		} else {
-			// Always return the standby (B) account credentials
-			respData["standby_username"] = role.StaticAccount.UsernameB
-			respData["standby_dn"] = role.StaticAccount.DNB
-			respData["standby_password"] = role.StaticAccount.PasswordB
-			respData["standby_last_password"] = role.StaticAccount.LastPasswordB
 		}
 
+		// During grace period, also return the standby account's credentials
 		if role.StaticAccount.RotationState == rotationStateGracePeriod {
+			if role.StaticAccount.ActiveAccount == activeAccountB {
+				// B is active, return A as standby
+				respData["standby_username"] = role.StaticAccount.Username
+				respData["standby_dn"] = role.StaticAccount.DN
+				respData["standby_password"] = role.StaticAccount.Password
+				respData["standby_last_password"] = role.StaticAccount.LastPassword
+			} else {
+				// A is active, return B as standby
+				respData["standby_username"] = role.StaticAccount.UsernameB
+				respData["standby_dn"] = role.StaticAccount.DNB
+				respData["standby_password"] = role.StaticAccount.PasswordB
+				respData["standby_last_password"] = role.StaticAccount.LastPasswordB
+			}
 			respData["grace_period_end"] = role.StaticAccount.GracePeriodEnd
 		}
 	}
